@@ -143,6 +143,7 @@ options:
                     - Condition operator.
                     - When I(type) is set to C(time_period), the choices are C(in), C(not in).
                     - C(matches), C(does not match), C(Yes) and C(No) condition operators work only with >= Zabbix 4.0
+                    - When I(type) is set to C(maintenance_status), the choices are C(Yes) and C(No) for Zabbix >= 6.0
                 choices:
                     - '='
                     - '<>'
@@ -518,14 +519,17 @@ class Zapi(ZapiWrapper):
 
         """
         try:
-            _action = self._zapi.action.get({
+            _params = {
                 "selectOperations": "extend",
                 "selectRecoveryOperations": "extend",
                 "selectAcknowledgeOperations": "extend",
                 "selectFilter": "extend",
                 'filter': {'name': [name]}
-            })
-            if len(_action) > 0:
+            }
+            if LooseVersion(self._zbx_api_version) >= LooseVersion('6.0'):
+                _params['selectUpdateOperations'] = _params.pop('selectAcknowledgeOperations', 'extend')
+            _action = self._zapi.action.get(_params)
+            if len(_action) > 0 and LooseVersion(self._zbx_api_version) < LooseVersion('6.0'):
                 _action[0]['recovery_operations'] = _action[0].pop('recoveryOperations', [])
                 _action[0]['acknowledge_operations'] = _action[0].pop('acknowledgeOperations', [])
             return _action
@@ -676,14 +680,40 @@ class Zapi(ZapiWrapper):
 
         """
         try:
-            discovery_check_list = self._zapi.dcheck.get({
-                'output': 'extend',
-                'filter': {'key_': [discovery_check_name]}
+            discovery_rule_name, dcheck_type = discovery_check_name.split(': ')
+            dcheck_type_to_number = {
+                'SSH': '0',
+                'LDAP': '1',
+                'SMTP': '2',
+                'FTP': '3',
+                'HTTP': '4',
+                'POP': '5',
+                'NNTP': '6',
+                'IMAP': '7',
+                'TCP': '8',
+                'Zabbix agent': '9',
+                'SNMPv1 agent': '10',
+                'SNMPv2 agent': '11',
+                'ICMP ping': '12',
+                'SNMPv3 agent': '13',
+                'HTTPS': '14',
+                'Telnet': '15'
+            }
+            if dcheck_type not in dcheck_type_to_number:
+                self._module.fail_json(msg="Discovery check type: %s does not exist" % dcheck_type)
+
+            discovery_rule_list = self._zapi.drule.get({
+                'output': ['dchecks'],
+                'filter': {'name': [discovery_rule_name]},
+                'selectDChecks': 'extend'
             })
-            if len(discovery_check_list) < 1:
+            if len(discovery_rule_list) < 1:
                 self._module.fail_json(msg="Discovery check not found: %s" % discovery_check_name)
-            else:
-                return discovery_check_list[0]
+
+            for dcheck in discovery_rule_list[0]['dchecks']:
+                if dcheck_type_to_number[dcheck_type] == dcheck['type']:
+                    return dcheck
+            self._module.fail_json(msg="Discovery check not found: %s" % discovery_check_name)
         except Exception as e:
             self._module.fail_json(msg="Failed to get discovery check '%s': %s" % (discovery_check_name, e))
 
@@ -869,6 +899,30 @@ class Action(ZabbixBase):
             _params.pop('ack_longdata', None)
             _params.pop('ack_shortdata', None)
 
+        if LooseVersion(self._zbx_api_version) >= LooseVersion('6.0'):
+            _params['update_operations'] = kwargs.get('update_operations')
+            if 'update_operations' in _params and not isinstance(_params.get('update_operations', None), type(None)):
+                _params.pop('acknowledge_operations', None)
+            elif isinstance(_params.get('acknowledge_operations', None), list):
+                _params['update_operations'] = _params.pop('acknowledge_operations', [])
+            else:
+                _params['update_operations'] = []
+                _params.pop('acknowledge_operations', None)
+
+            if 'esc_period' in _params and isinstance(_params.get('esc_period', None), type(None)):
+                _params.pop('esc_period')
+
+            if 'recovery_operations' in _params:
+                if isinstance(_params.get('recovery_operations', None), type(None)) or len(_params.get('recovery_operations', [])) == 0:
+                    _params.pop('recovery_operations')
+
+            if 'update_operations' in _params:
+                if isinstance(_params.get('update_operations', None), type(None)) or len(_params.get('update_operations', [])) == 0:
+                    _params.pop('update_operations')
+
+            if _params['eventsource'] not in ['trigger', 'internal']:
+                _params.pop('esc_period')
+
         return _params
 
     def check_difference(self, **kwargs):
@@ -1026,31 +1080,42 @@ class Operations(Zapi):
             list: constructed operation command
         """
         try:
-            return {
-                'type': to_numeric_value([
-                    'custom_script',
-                    'ipmi',
-                    'ssh',
-                    'telnet',
-                    'global_script'], operation.get('command_type', 'custom_script')),
-                'command': operation.get('command'),
-                'execute_on': to_numeric_value([
-                    'agent',
-                    'server',
-                    'proxy'], operation.get('execute_on', 'server')),
-                'scriptid': self._zapi_wrapper.get_script_by_script_name(
-                    operation.get('script_name')
-                ).get('scriptid'),
-                'authtype': to_numeric_value([
-                    'password',
-                    'public_key'
-                ], operation.get('ssh_auth_type')),
-                'privatekey': operation.get('ssh_privatekey_file'),
-                'publickey': operation.get('ssh_publickey_file'),
-                'username': operation.get('username'),
-                'password': operation.get('password'),
-                'port': operation.get('port')
-            }
+            if LooseVersion(self._zbx_api_version) < LooseVersion('6.0'):
+                opcommand = {
+                    'type': to_numeric_value([
+                        'custom_script',
+                        'ipmi',
+                        'ssh',
+                        'telnet',
+                        'global_script'], operation.get('command_type', 'custom_script')),
+                    'command': operation.get('command'),
+                    'execute_on': to_numeric_value([
+                        'agent',
+                        'server',
+                        'proxy'], operation.get('execute_on', 'server')),
+                    'scriptid': self._zapi_wrapper.get_script_by_script_name(
+                        operation.get('script_name')
+                    ).get('scriptid'),
+                    'authtype': to_numeric_value([
+                        'password',
+                        'public_key'
+                    ], operation.get('ssh_auth_type')),
+                    'privatekey': operation.get('ssh_privatekey_file'),
+                    'publickey': operation.get('ssh_publickey_file'),
+                    'username': operation.get('username'),
+                    'password': operation.get('password'),
+                    'port': operation.get('port')
+                }
+            else:
+                # In 6.0 opcommand is an opbject with just one key 'scriptid'
+                opcommand = {
+                    'scriptid': self._zapi_wrapper.get_script_by_script_name(
+                        operation.get('script_name')
+                    ).get('scriptid')
+                }
+
+            return opcommand
+
         except Exception as e:
             self._module.fail_json(msg="Failed to construct operation command. The error was: %s" % e)
 
@@ -1148,7 +1213,7 @@ class Operations(Zapi):
             }]
         return []
 
-    def construct_the_data(self, operations):
+    def construct_the_data(self, operations, event_source):
         """Construct the operation data using helper methods.
 
         Args:
@@ -1171,14 +1236,20 @@ class Operations(Zapi):
                 constructed_operation['opmessage'] = self._construct_opmessage(op)
                 constructed_operation['opmessage_usr'] = self._construct_opmessage_usr(op)
                 constructed_operation['opmessage_grp'] = self._construct_opmessage_grp(op)
-                constructed_operation['opconditions'] = self._construct_opconditions(op)
+
+                if LooseVersion(self._zbx_api_version) < LooseVersion('6.0'):
+                    constructed_operation['opconditions'] = self._construct_opconditions(op)
 
             # Send Command type
             if constructed_operation['operationtype'] == '1':
                 constructed_operation['opcommand'] = self._construct_opcommand(op)
                 constructed_operation['opcommand_hst'] = self._construct_opcommand_hst(op)
                 constructed_operation['opcommand_grp'] = self._construct_opcommand_grp(op)
-                constructed_operation['opconditions'] = self._construct_opconditions(op)
+                if LooseVersion(self._zbx_api_version) < LooseVersion('6.0'):
+                    constructed_operation['opconditions'] = self._construct_opconditions(op)
+                elif event_source == 'trigger':
+                    # opconditions valid only for 'trigger' action
+                    constructed_operation['opconditions'] = self._construct_opconditions(op)
 
             # Add to/Remove from host group
             if constructed_operation['operationtype'] in ('4', '5'):
@@ -1191,6 +1262,11 @@ class Operations(Zapi):
             # Set inventory mode
             if constructed_operation['operationtype'] == '10':
                 constructed_operation['opinventory'] = self._construct_opinventory(op)
+
+            # Remove escalation params when escalation period is None (null)
+            if isinstance(constructed_operation.get('esc_period'), type(None)):
+                constructed_operation.pop('esc_step_from')
+                constructed_operation.pop('esc_step_to')
 
             constructed_data.append(constructed_operation)
 
@@ -1245,10 +1321,17 @@ class RecoveryOperations(Operations):
             }
 
             # Send Message type
-            if constructed_operation['operationtype'] in ('0', '11'):
+            if constructed_operation['operationtype'] == '0':
                 constructed_operation['opmessage'] = self._construct_opmessage(op)
                 constructed_operation['opmessage_usr'] = self._construct_opmessage_usr(op)
                 constructed_operation['opmessage_grp'] = self._construct_opmessage_grp(op)
+                if LooseVersion(self._zbx_api_version) >= LooseVersion('6.0'):
+                    constructed_operation['opmessage'].pop('mediatypeid')
+
+            if constructed_operation['operationtype'] == '11':
+                constructed_operation['opmessage'] = self._construct_opmessage(op)
+                if LooseVersion(self._zbx_api_version) >= LooseVersion('6.0'):
+                    constructed_operation['opmessage'].pop('mediatypeid')
 
             # Send Command type
             if constructed_operation['operationtype'] == '1':
@@ -1310,10 +1393,17 @@ class AcknowledgeOperations(Operations):
             }
 
             # Send Message type
-            if constructed_operation['operationtype'] in ('0', '11'):
+            if constructed_operation['operationtype'] == '0':
                 constructed_operation['opmessage'] = self._construct_opmessage(op)
                 constructed_operation['opmessage_usr'] = self._construct_opmessage_usr(op)
                 constructed_operation['opmessage_grp'] = self._construct_opmessage_grp(op)
+                if LooseVersion(self._zbx_api_version) >= LooseVersion('6.0'):
+                    constructed_operation['opmessage'].pop('mediatypeid')
+
+            if constructed_operation['operationtype'] == '12':
+                constructed_operation['opmessage'] = self._construct_opmessage(op)
+                if LooseVersion(self._zbx_api_version) >= LooseVersion('6.0'):
+                    constructed_operation['opmessage'].pop('mediatypeid')
 
             # Send Command type
             if constructed_operation['operationtype'] == '1':
@@ -1520,6 +1610,13 @@ class Filter(Zapi):
                 )
             if conditiontype == '13':
                 return self._zapi_wrapper.get_template_by_template_name(value)['templateid']
+            if LooseVersion(self._zapi_wrapper._zbx_api_version) >= LooseVersion('6.0'):
+                # maintenance_status
+                if conditiontype == '16':
+                    return to_numeric_value([
+                        "Yes",
+                        "No"], value
+                    )
             if conditiontype == '18':
                 return self._zapi_wrapper.get_discovery_rule_by_discovery_rule_name(value)['druleid']
             if conditiontype == '19':
@@ -1728,7 +1825,7 @@ def main():
                 formulaid=dict(type='str', required=False),
                 operator=dict(type='str', required=True),
                 type=dict(type='str', required=True),
-                value=dict(type='str', required=True),
+                value=dict(type='str', required=False),
                 value2=dict(type='str', required=False)
             ),
             required_if=[
@@ -1969,7 +2066,6 @@ def main():
         argument_spec=argument_spec,
         required_if=[
             ['state', 'present', [
-                'esc_period',
                 'event_source'
             ]]
         ],
@@ -2010,7 +2106,7 @@ def main():
             result = action.delete_action(action_id)
             module.exit_json(changed=True, msg="Action Deleted: %s, ID: %s" % (name, result))
         else:
-            difference = action.check_difference(
+            kwargs = dict(
                 action_id=action_id,
                 name=name,
                 event_source=event_source,
@@ -2023,11 +2119,17 @@ def main():
                 recovery_default_subject=recovery_default_subject,
                 acknowledge_default_message=acknowledge_default_message,
                 acknowledge_default_subject=acknowledge_default_subject,
-                operations=ops.construct_the_data(operations),
+                operations=ops.construct_the_data(operations, event_source),
                 recovery_operations=recovery_ops.construct_the_data(recovery_operations),
-                acknowledge_operations=acknowledge_ops.construct_the_data(acknowledge_operations),
                 conditions=fltr.construct_the_data(eval_type, formula, conditions)
             )
+
+            if LooseVersion(zapi_wrapper._zbx_api_version) >= LooseVersion('6.0'):
+                kwargs[argument_spec['acknowledge_operations']['aliases'][0]] = acknowledge_ops.construct_the_data(acknowledge_operations)
+            else:
+                kwargs['acknowledge_operations'] = acknowledge_ops.construct_the_data(acknowledge_operations)
+
+            difference = action.check_difference(**kwargs)
 
             if difference == {}:
                 module.exit_json(changed=False, msg="Action is up to date: %s" % (name))
@@ -2041,7 +2143,7 @@ def main():
         if state == "absent":
             module.exit_json(changed=False)
         else:
-            action_id = action.add_action(
+            kwargs = dict(
                 name=name,
                 event_source=event_source,
                 esc_period=esc_period,
@@ -2053,11 +2155,17 @@ def main():
                 recovery_default_subject=recovery_default_subject,
                 acknowledge_default_message=acknowledge_default_message,
                 acknowledge_default_subject=acknowledge_default_subject,
-                operations=ops.construct_the_data(operations),
+                operations=ops.construct_the_data(operations, event_source),
                 recovery_operations=recovery_ops.construct_the_data(recovery_operations),
-                acknowledge_operations=acknowledge_ops.construct_the_data(acknowledge_operations),
                 conditions=fltr.construct_the_data(eval_type, formula, conditions)
             )
+
+            if LooseVersion(zapi_wrapper._zbx_api_version) >= LooseVersion('6.0'):
+                kwargs[argument_spec['acknowledge_operations']['aliases'][0]] = acknowledge_ops.construct_the_data(acknowledge_operations)
+            else:
+                kwargs['acknowledge_operations'] = acknowledge_ops.construct_the_data(acknowledge_operations)
+
+            action_id = action.add_action(**kwargs)
             module.exit_json(changed=True, msg="Action created: %s, ID: %s" % (name, action_id))
 
 
